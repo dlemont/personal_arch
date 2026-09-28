@@ -1,0 +1,137 @@
+name: Build Arch LXQt KWin ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+
+      - name: Build ISO via Docker Container
+        run: |
+          mkdir -p out build-scripts
+          
+          cat << 'EOF' > build-scripts/build.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Enable multilib for 32-bit gaming / Wine / Steam
+          sed -i '/\[multilib\]/,/Include/s/^[# ]*//' /etc/pacman.conf
+          pacman -Syu --noconfirm archiso git
+
+          # Copy baseline releng profile
+          cp -r /usr/share/archiso/configs/releng /tmp/profile
+
+          # 1. Append custom package list
+          cat << 'PKGS' >> /tmp/profile/packages.x86_64
+          linux-zen
+          linux-zen-headers
+          kwin
+          wayland
+          xorg-xwayland
+          seatd
+          qt6-wayland
+          qt5-wayland
+          lxqt
+          lxqt-wayland-session
+          pavucontrol-qt
+          qps
+          screengrab
+          featherpad
+          pcmanfm-qt
+          lxqt-archiver
+          pipewire
+          pipewire-pulse
+          pipewire-alsa
+          pipewire-jack
+          wireplumber
+          mesa
+          vulkan-icd-loader
+          lib32-mesa
+          lib32-vulkan-icd-loader
+          vulkan-tools
+          wine-staging
+          winetricks
+          gamemode
+          lib32-gamemode
+          gamescope
+          mangohud
+          lib32-mangohud
+          steam
+          sddm
+          polkit-kde-agent
+          PKGS
+
+          # 2. Configure LXQt Wayland session to use KWin
+          mkdir -p /tmp/profile/airootfs/etc/xdg/lxqt
+          cat << 'CONF' > /tmp/profile/airootfs/etc/xdg/lxqt/session.conf
+          [General]
+          window_manager=kwin_wayland
+
+          [Environment]
+          QT_QPA_PLATFORM=wayland;xcb
+          GDK_BACKEND=wayland,x11
+          SDL_VIDEODRIVER=wayland
+          CLUTTER_BACKEND=wayland
+          MOZ_ENABLE_WAYLAND=1
+          CONF
+
+          # 3. Configure SDDM to run on Wayland
+          mkdir -p /tmp/profile/airootfs/etc/sddm.conf.d
+          cat << 'CONF' > /tmp/profile/airootfs/etc/sddm.conf.d/10-wayland.conf
+          [General]
+          DisplayServer=wayland
+          GreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell
+
+          [Theme]
+          Current=breeze
+          CONF
+
+          # 4. System limits & Swappiness for Gaming
+          mkdir -p /tmp/profile/airootfs/etc/security/limits.d
+          cat << 'CONF' > /tmp/profile/airootfs/etc/security/limits.d/99-game-perf.conf
+          @wheel   hard    rtprio          98
+          @wheel   soft    rtprio          98
+          @wheel   hard    memlock         unlimited
+          @wheel   soft    memlock         unlimited
+          CONF
+
+          mkdir -p /tmp/profile/airootfs/etc/sysctl.d
+          cat << 'CONF' > /tmp/profile/airootfs/etc/sysctl.d/99-gaming.conf
+          vm.swappiness = 10
+          vm.vfs_cache_pressure = 50
+          vm.max_map_count = 2147483642
+          CONF
+
+          # 5. Enable default services in live ISO
+          mkdir -p /tmp/profile/airootfs/etc/systemd/system/display-manager.service.wants
+          mkdir -p /tmp/profile/airootfs/etc/systemd/system/multi-user.target.wants
+
+          ln -sf /usr/lib/systemd/system/sddm.service /tmp/profile/airootfs/etc/systemd/system/display-manager.service
+          ln -sf /usr/lib/systemd/system/NetworkManager.service /tmp/profile/airootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service
+
+          # 6. Compile ISO
+          mkarchiso -v -w /tmp/archiso-tmp -o /workspace/out /tmp/profile
+          EOF
+
+          chmod +x build-scripts/build.sh
+
+          docker run --privileged --rm \
+            -v ${{ github.workspace }}:/workspace \
+            archlinux:base-devel /workspace/build-scripts/build.sh
+
+      - name: Create GitHub Release with ISO
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.0-${{ github.run_number }}"
+          name: "Arch Linux (LXQt + KWin Wayland) Build ${{ github.run_number }}"
+          files: out/*.iso
